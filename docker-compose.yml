@@ -1,0 +1,419 @@
+version: "3.8"
+
+# ---------------------------------------------------------------
+# Full pipeline: Consumers -> MinIO -> Airflow -> PostgreSQL -> Metabase
+# ---------------------------------------------------------------
+
+x-airflow-common: &airflow-common
+  build: ./airflow
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: "81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs="
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/transforms:/opt/airflow/transforms
+    - ./airflow/plugins:/opt/airflow/plugins
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+    warehouse-db:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+services:
+
+  # ==============================================================
+  # DATABASES
+  # ==============================================================
+
+  # Airflow metadata database (internal to Airflow)
+  airflow-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Data warehouse (where transformed data lands)
+  warehouse-db:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"   # 5433 to avoid conflict with airflow-db
+    environment:
+      POSTGRES_DB: warehouse
+      POSTGRES_USER: warehouse_user
+      POSTGRES_PASSWORD: warehouse_pass
+    volumes:
+      - warehouse_db_data:/var/lib/postgresql/data
+      - ./warehouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warehouse_user -d warehouse"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ==============================================================
+  # DATA LAKE
+  # ==============================================================
+
+  minio:
+    image: minio/minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5673:5672"     # AMQP protocol (producers and consumers connect here)
+      - "15673:15672"   # Management UI (monitor queues, messages, consumers)
+    environment:
+      RABBITMQ_DEFAULT_USER: pipeline
+      RABBITMQ_DEFAULT_PASS: pipeline123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==============================================================
+  # CONSUMERS (same image, different config)
+  # ==============================================================
+
+  consumer-binance:
+    build: ./consumer
+    depends_on:
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SOURCE_NAME: binance
+      SOURCE_TYPE: websocket
+      SOURCE_URL: wss://stream.binance.com:9443/ws/btcusdt@trade
+      SINK_BUCKET: raw
+      SINK_PATH: binance/trades/
+      SINK_TYPE: rabbitmq
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: pipeline
+      RABBITMQ_PASS: pipeline123
+      RABBITMQ_EXCHANGE: raw_events
+      BATCH_SIZE: 100
+      BATCH_TIMEOUT: 5
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  consumer-coingecko:
+    build: ./consumer
+    depends_on:
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SOURCE_NAME: coingecko
+      SOURCE_TYPE: rest_poll
+      SOURCE_URL: "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd,eur&include_24hr_change=true&include_market_cap=true"
+      SOURCE_POLL_INTERVAL: 60
+      SINK_BUCKET: raw
+      SINK_PATH: coingecko/prices/
+      SINK_TYPE: rabbitmq
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: pipeline
+      RABBITMQ_PASS: pipeline123
+      RABBITMQ_EXCHANGE: raw_events
+      BATCH_SIZE: 1
+      BATCH_TIMEOUT: 30
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  consumer-blockchain:
+    build: ./consumer
+    depends_on:
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SOURCE_NAME: blockchain
+      SOURCE_TYPE: websocket
+      SOURCE_URL: wss://ws.blockchain.info/inv
+      SOURCE_SUBSCRIBE_MSG: '{"op": "unconfirmed_sub"}'
+      SINK_BUCKET: raw
+      SINK_PATH: blockchain/transactions/
+      SINK_TYPE: rabbitmq
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: pipeline
+      RABBITMQ_PASS: pipeline123
+      RABBITMQ_EXCHANGE: raw_events
+      BATCH_SIZE: 50
+      BATCH_TIMEOUT: 10
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  consumer-coinbase:
+    build: ./consumer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SOURCE_NAME: coinbase
+      SOURCE_TYPE: websocket
+      SOURCE_URL: wss://ws-feed.exchange.coinbase.com
+      SOURCE_SUBSCRIBE_MSG: '{"type": "subscribe", "channels": [{"name": "ticker", "product_ids": ["BTC-USD", "ETH-USD"]}]}'
+      SINK_TYPE: rabbitmq
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: pipeline
+      RABBITMQ_PASS: pipeline123
+      RABBITMQ_EXCHANGE: raw_events
+      BATCH_SIZE: 10
+      BATCH_TIMEOUT: 10
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  consumer-usgs:
+    build: ./consumer
+    depends_on:
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SOURCE_NAME: usgs
+      SOURCE_TYPE: rest_poll
+      SOURCE_URL: "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"
+      SOURCE_POLL_INTERVAL: 300
+      SINK_BUCKET: raw
+      SINK_PATH: usgs/earthquakes/
+      SINK_TYPE: rabbitmq
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: pipeline
+      RABBITMQ_PASS: pipeline123
+      RABBITMQ_EXCHANGE: raw_events
+      BATCH_SIZE: 1
+      BATCH_TIMEOUT: 30
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  consumer-nasa:
+    build: ./consumer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SOURCE_NAME: nasa
+      SOURCE_TYPE: rest_poll
+      SOURCE_URL: "https://api.nasa.gov/neo/rest/v1/feed?api_key=DEMO_KEY"
+      SOURCE_POLL_INTERVAL: 3600
+      SINK_TYPE: rabbitmq
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: pipeline
+      RABBITMQ_PASS: pipeline123
+      RABBITMQ_EXCHANGE: raw_events
+      BATCH_SIZE: 1
+      BATCH_TIMEOUT: 30
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  consumer-wikipedia:
+      build: ./consumer
+      depends_on:
+        rabbitmq:
+          condition: service_healthy
+      environment:
+        SOURCE_NAME: wikipedia
+        SOURCE_TYPE: sse
+        SOURCE_URL: https://stream.wikimedia.org/v2/stream/recentchange
+        SINK_TYPE: rabbitmq
+        RABBITMQ_HOST: rabbitmq
+        RABBITMQ_PORT: 5672
+        RABBITMQ_USER: pipeline
+        RABBITMQ_PASS: pipeline123
+        RABBITMQ_EXCHANGE: raw_events
+        BATCH_SIZE: 100
+        BATCH_TIMEOUT: 5
+        MINIO_ENDPOINT: minio:9000
+        MINIO_ACCESS_KEY: minio
+        MINIO_SECRET_KEY: minio123
+        LOG_LEVEL: INFO
+      restart: unless-stopped
+
+
+  # ==============================================================
+  # QUEUE WORKER (RabbitMQ -> MinIO)
+  # ==============================================================
+
+  worker:
+    build: ./worker
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: pipeline
+      RABBITMQ_PASS: pipeline123
+      RABBITMQ_EXCHANGE: raw_events
+      RABBITMQ_QUEUE: raw_events_queue
+      RABBITMQ_BINDING_KEYS: "#"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      SINK_BUCKET: raw
+      WORKER_BATCH_SIZE: 50
+      WORKER_BATCH_TIMEOUT: 10
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  # ==============================================================
+  # AIRFLOW (orchestration)
+  # ==============================================================
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db init
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+        echo "Airflow initialized"
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ==============================================================
+  # VISUALIZATION
+  # ==============================================================
+
+  metabase:
+    image: metabase/metabase:latest
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: warehouse-db
+      MB_DB_PORT: 5432
+      MB_DB_DBNAME: warehouse
+      MB_DB_USER: warehouse_user
+      MB_DB_PASS: warehouse_pass
+    depends_on:
+      warehouse-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ==============================================================
+  # ALERTING
+  # ==============================================================
+
+  mattermost-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mattermost
+      POSTGRES_USER: mattermost
+      POSTGRES_PASSWORD: mattermost_pass
+    volumes:
+      - mattermost_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U mattermost" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:latest
+    platform: linux/amd64
+    ports:
+      - "8065:8065"
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: "postgres://mattermost:mattermost_pass@mattermost-db:5432/mattermost?sslmode=disable"
+      MM_SERVICESETTINGS_SITEURL: "http://localhost:8065"
+      MM_SERVICESETTINGS_ENABLEINCOMINGWEBHOOKS: "true"
+    depends_on:
+      mattermost-db:
+        condition: service_healthy
+    volumes:
+      - mattermost_data:/mattermost/data
+    restart: unless-stopped
+
+volumes:
+  minio_data:
+  airflow_db_data:
+  warehouse_db_data:
+  rabbitmq_data:
+  mattermost_db_data:
+  mattermost_data:
