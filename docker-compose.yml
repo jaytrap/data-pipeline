@@ -273,6 +273,7 @@ services:
         SOURCE_NAME: wikipedia
         SOURCE_TYPE: sse
         SOURCE_URL: https://stream.wikimedia.org/v2/stream/recentchange
+        SOURCE_HEADERS: "User-Agent:data-pipeline/1.0 (desmond@kazahtech.com)"
         SINK_TYPE: rabbitmq
         RABBITMQ_HOST: rabbitmq
         RABBITMQ_PORT: 5672
